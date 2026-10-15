@@ -16,33 +16,35 @@ def tool_name(tool) -> str | None:
 
 
 class FakeChatModel(BaseChatModel):
-    """Replays scripted replies in order; the last reply repeats once the script runs out.
+    """Replays scripted replies in order; the last reply repeats once the script runs out. A call whose reply is an
+    exception raises it, and one whose reply is a function returns or raises what the function does.
 
-    `bind_tools` returns the model itself and records its arguments; each call records the bind in force. The
-    first `failures` calls raise `error`."""
+    `bind_tools` returns the model itself and records its arguments; each call records the bind in force and the
+    timeout it was given."""
 
-    replies: list[AIMessage] = Field(default_factory=list)
-    error: Exception | None = None
-    failures: int = 10**6
+    replies: list = Field(default_factory=list)
     calls: list[list[BaseMessage]] = Field(default_factory=list)
     binds: list[dict] = Field(default_factory=list)
     call_binds: list[dict] = Field(default_factory=list)
+    timeouts: list[float | None] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
         return "fake-desk-model"
 
     def bind_tools(self, tools, **kwargs):
-        self.binds.append({"tools": [tool_name(t) for t in tools], **kwargs})
+        self.binds.append({"tools": [tool_name(t) for t in tools], "given": list(tools), **kwargs})
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
         self.calls.append(list(messages))
         self.call_binds.append(self.binds[-1] if self.binds else {})
-        if self.error is not None and len(self.calls) <= self.failures:
-            raise self.error
-        answered = len(self.calls) - (min(self.failures, len(self.calls)) if self.error is not None else 0)
-        reply = self.replies[min(answered, len(self.replies)) - 1]
+        self.timeouts.append(kwargs.get("timeout"))
+        reply = self.replies[min(len(self.calls), len(self.replies)) - 1]
+        if callable(reply):
+            reply = reply()
+        if isinstance(reply, Exception):
+            raise reply
         return ChatResult(generations=[ChatGeneration(message=reply)])
 
 

@@ -126,12 +126,15 @@ applies, each in its own transaction, the ones past a file's version, with forei
 ## The assistant
 
 `app/assistant/model.py` builds a `ChatOpenAI` model from `OPENAI_API_KEY`. `app/assistant/loop.py` runs the
-tool-calling loop. A question gets at most six model calls: the first five go to `model.bind_tools(TOOLS)`, and if
-the loop reaches a sixth it goes to `model.bind_tools(TOOLS, tool_choice="none")`, so it answers in text. A question
-may make at most 12 tool calls and save at most one note. It has 90 seconds in all, counted from when the loop starts
-and including the time its tool calls take: each model call waits at most 30 seconds or the time left, whichever is
-less, a failed call is tried once more only while time is left, and no model call starts once the time is up. A tool
-call whose arguments cannot be read gets an error result, as does one whose tool fails, and the loop carries on.
+tool-calling loop. A question gets at most six model calls. They go to `model.bind_tools(TOOLS)` until the last one,
+which goes to `model.bind_tools(TOOLS, tool_choice="none")`, so it answers in text from the tool results it has. A
+question may make at most 12 tool calls and save at most one note. It has 90 seconds in all, counted from when the
+loop starts. The model calls that may ask for tools and the tool calls themselves share the first 70: each model call
+waits at most 30 seconds and each tool call at most 30 seconds, or what is left of the 70, whichever is less. The last
+call is the sixth, or the next one once the 70 seconds are used; it waits at most 30 seconds or what is left of the 90,
+which is at least 20 when the earlier calls kept to their limits. A failed model call is tried once more only while
+its time is left, and no model call starts once the 90 seconds are up. A tool call whose arguments cannot be read
+gets an error result, as does one whose tool fails or does not finish in its time, and the loop carries on.
 The answer comes back with the list of tool calls that returned a result, name and arguments; refused and failed
 calls are recorded in `activity` instead.
 
@@ -146,8 +149,8 @@ calls are recorded in `activity` instead.
 The tools run on the submission id from the request path. A call that leaves `submission_id` out reads the
 submission in the path; one that names a different submission (anything but that number or a string of its ASCII
 digits) is refused and recorded in `activity` as `scope_refused`. A call to an unknown tool, a second `save_note` and
-a call past the twelve are refused and recorded as `tool_refused`, and a call whose tool fails is recorded as
-`tool_failed` with the tool's name. The assistant does not quote, bind or write a premium; those go through the
+a call past the twelve are refused and recorded as `tool_refused`, and a call whose tool fails or does not finish in
+its time is recorded as `tool_failed` with the tool's name. The assistant does not quote, bind or write a premium; those go through the
 decide route.
 
 ## Roles
@@ -167,8 +170,6 @@ Keddie and Lorna Fitzhugh in claims (viewers). Emails are `first.last@ketterlyuw
 Python 3.12.
 
 ```sh
-python -m venv .venv
-. .venv/bin/activate        # Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
 python -m app               # listens on 127.0.0.1:$PORT, default 8000
 ```

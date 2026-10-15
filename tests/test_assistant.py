@@ -1,17 +1,20 @@
 import itertools
 import json
 import sqlite3
+import threading
+import time
 from datetime import date, timedelta
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
+from pydantic import BaseModel
 
 import app.assistant.loop as loop
 import app.submissions
 from app.assistant.model import build_model
 from tests.conftest import NOW, PRIYA, a_submission, other_submission, sign_in, staff_id
-from tests.fake_model import FakeChatModel, PayloadRecordingOpenAI, tool_call
+from tests.fake_model import FakeChatModel, PayloadRecordingOpenAI, tool_call, tool_name
 
 DESK_TOOLS = {
     "submission_summary": {},
@@ -137,7 +140,21 @@ def test_the_last_request_keeps_the_desk_tools_and_turns_tool_use_off(make_clien
     assert response.status_code == 200 and len(model.payloads) == 6
     last = model.payloads[-1]
     assert last["tool_choice"] == "none"
-    assert set(DESK_TOOLS) <= {t["function"]["name"] if "function" in t else t["name"] for t in last["tools"]}
+    assert set(DESK_TOOLS) <= {tool_name(t) for t in last["tools"]}
+
+
+def test_an_unnamed_tool_entry_is_bound_on_every_call_beside_the_desk_tools(make_client, db, monkeypatch):
+    hosted = {"type": "hosted_lookup"}
+    monkeypatch.setattr(loop, "TOOLS", [*loop.TOOLS, hosted])
+    sub_id = a_submission(db)
+    model = FakeChatModel(replies=[
+        AIMessage(content="Reading the facts.", tool_calls=[tool_call("facts", submission_id=sub_id)]),
+    ])
+    response = ask(make_client(model), sub_id)
+    assert response.status_code == 200 and response.json()["answer"] == "Reading the facts."
+    assert len(model.calls) == loop.MAX_MODEL_CALLS
+    assert all(hosted in bind["given"] for bind in model.call_binds)
+    assert set(DESK_TOOLS) <= set(model.call_binds[-1]["tools"])
 
 
 def test_unreadable_tool_calls_get_an_error_result(make_client, db):
@@ -188,26 +205,200 @@ def test_save_note_refuses_long_or_blank_text(make_client, db, body):
 
 
 def test_model_failure_is_a_502_problem(make_client, db):
-    model = FakeChatModel(error=TimeoutError("read timed out"))
+    model = FakeChatModel(replies=[TimeoutError("read timed out")])
     response = ask(make_client(model), a_submission(db))
     assert response.status_code == 502 and response.json()["code"] == "model_call_failed"
 
 
 def test_failed_model_call_is_retried_once(make_client, db):
-    model = FakeChatModel(replies=[AIMessage(content="The inspection was clean.")],
-                          error=TimeoutError("read timed out"), failures=1)
+    model = FakeChatModel(replies=[TimeoutError("read timed out"), AIMessage(content="The inspection was clean.")])
     response = ask(make_client(model), a_submission(db))
     assert response.status_code == 200 and len(model.calls) == 2
 
 
-def test_no_model_call_starts_after_the_question_deadline(make_client, db, monkeypatch):
-    seconds = itertools.count(step=40)
-    monkeypatch.setattr(loop, "monotonic", lambda: next(seconds))
+class Clock:
+    """Stands in for the loop's clock, in seconds."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def moves_to(self, seconds: float):
+        return lambda: setattr(self, "now", seconds)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    clock = Clock()
+    monkeypatch.setattr(loop, "monotonic", clock)
+    return clock
+
+
+@pytest.fixture
+def release():
+    """Holds a slow tool until the test ends."""
+    event = threading.Event()
+    yield event
+    event.set()
+
+
+def adding_tool(**tools):
+    """Adds `lookup` to the loop's tools; `tools[key]` runs when it is called with that key."""
+    @tool
+    def lookup(key: str) -> str:
+        """Returns the value kept under a key."""
+        tools.get(key, lambda: None)()
+        return f"value for {key}"
+
+    return [*loop.TOOLS, lookup]
+
+
+def test_a_tool_that_runs_past_its_limit_gets_a_failed_result(make_client, db, monkeypatch, release):
+    monkeypatch.setattr(loop, "TOOLS", adding_tool(slow=lambda: release.wait(10)))
+    monkeypatch.setattr(loop, "TOOL_CALL_SECONDS", 0.05)
+    model = scripted(tool_call("lookup", key="slow"), answer="The value did not come back.")
+    response = ask(make_client(model), a_submission(db))
+    assert response.status_code == 200 and len(model.calls) == 2
+    result, = tool_messages(model, 1)
+    assert result.status == "error" and "TimeoutError" in result.content
+    failure, = activity(db, "tool_failed")
+    assert failure["detail"].startswith("lookup:")
+
+
+def test_a_tool_waits_no_longer_than_the_time_left_for_tools(make_client, db, monkeypatch, clock, release):
+    tools_until = loop.QUESTION_DEADLINE_SECONDS - loop.FINAL_CALL_SECONDS
+    monkeypatch.setattr(loop, "TOOLS", adding_tool(quick=clock.moves_to(tools_until - 0.05),
+                                                   slow=lambda: release.wait(10)))
+    call = tool_call("lookup", key="quick"), tool_call("lookup", call_id="call_2", key="slow")
+    model = FakeChatModel(replies=[AIMessage(content="", tool_calls=list(call)), AIMessage(content="One value.")])
+    response = ask(make_client(model), a_submission(db))
+    assert response.status_code == 200
+    quick, slow = tool_messages(model, 1)
+    assert quick.content == "value for quick" and slow.status == "error" and "TimeoutError" in slow.content
+
+
+def test_once_the_time_for_tools_is_up_the_tools_off_call_answers_with_the_finished_results(make_client, db,
+                                                                                            monkeypatch, clock):
     sub_id = a_submission(db)
-    model = FakeChatModel(replies=[AIMessage(content="", tool_calls=[tool_call("facts", submission_id=sub_id)])])
+    monkeypatch.setattr(loop, "TOOLS", adding_tool(long=clock.moves_to(71)))
+    calls = [tool_call("lookup", key="long"), tool_call("facts", call_id="call_2", submission_id=sub_id)]
+    model = FakeChatModel(replies=[AIMessage(content="", tool_calls=calls), AIMessage(content="One value came back.")])
     response = ask(make_client(model), sub_id)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"answer": "One value came back.",
+                               "tool_calls": [{"name": "lookup", "args": {"key": "long"}}]}
+    assert len(model.calls) == 2 and model.call_binds[-1].get("tool_choice") == "none"
+    assert model.timeouts[-1] == min(loop.MODEL_CALL_SECONDS, loop.QUESTION_DEADLINE_SECONDS - 71)
+    finished, unstarted = tool_messages(model, 1)
+    assert finished.content == "value for long" and unstarted.status == "error"
+    assert [r["detail"].split(":")[0] for r in activity(db, "tool_failed")] == ["facts"]
+
+
+def test_a_retry_cut_off_by_the_time_for_tools_leaves_the_tools_off_call_to_answer(make_client, db,
+                                                                                    monkeypatch, clock):
+    monkeypatch.setattr(loop, "TOOLS", adding_tool(long=clock.moves_to(50)))
+
+    def cut_off():
+        clock.now = loop.QUESTION_DEADLINE_SECONDS - loop.FINAL_CALL_SECONDS
+        raise TimeoutError("read timed out")
+
+    model = FakeChatModel(replies=[AIMessage(content="", tool_calls=[tool_call("lookup", key="long")]),
+                                   RuntimeError("server error"), cut_off, AIMessage(content="One value came back.")])
+    response = ask(make_client(model), a_submission(db))
+    assert response.status_code == 200, response.text
+    assert response.json() == {"answer": "One value came back.",
+                               "tool_calls": [{"name": "lookup", "args": {"key": "long"}}]}
+    assert len(model.calls) == 4 and model.call_binds[-1].get("tool_choice") == "none"
+    assert model.timeouts[2] == loop.QUESTION_DEADLINE_SECONDS - loop.FINAL_CALL_SECONDS - 50
+    assert [m.content for m in tool_messages(model, 3)] == ["value for long"]
+
+
+def test_no_model_call_starts_after_the_question_deadline(make_client, db, monkeypatch, clock):
+    monkeypatch.setattr(loop, "TOOLS", adding_tool(long=clock.moves_to(91)))
+    model = scripted(tool_call("lookup", key="long"))
+    response = ask(make_client(model), a_submission(db))
     assert response.status_code == 502 and "deadline" in response.json()["detail"]
-    assert len(model.calls) == 2
+    assert len(model.calls) == 1
+
+
+class Item(BaseModel):
+    label: str
+
+
+@pytest.mark.parametrize("result, text", [
+    ("Zoë — déjà vu ✓", "Zoë — déjà vu ✓"),
+    ({"label": "Zoë", "on": date(2019, 4, 1)}, '{"label": "Zoë", "on": "2019-04-01"}'),
+    (Item(label="déjà vu – ok"), '{"label": "déjà vu – ok"}'),
+    ([Item(label="déjà vu"), {"item": Item(label="ok")}], '[{"label": "déjà vu"}, {"item": {"label": "ok"}}]'),
+], ids=["string", "dict", "pydantic", "pydantic inside a list"])
+def test_tool_results_reach_the_model_as_text(make_client, db, monkeypatch, result, text):
+    @tool
+    def lookup() -> object:
+        """Returns a value."""
+        return result
+
+    monkeypatch.setattr(loop, "TOOLS", [*loop.TOOLS, lookup])
+    model = scripted(tool_call("lookup"))
+    ask(make_client(model), a_submission(db))
+    assert tool_messages(model, 1)[0].content == text
+
+
+@pytest.mark.parametrize("doc", ["Returns the value kept under a key.", None])
+def test_a_plain_function_in_the_tools_is_bound_and_run(make_client, db, monkeypatch, doc):
+    def lookup(key: str) -> str:
+        return f"value for {key}"
+
+    lookup.__doc__ = doc
+    monkeypatch.setattr(loop, "TOOLS", [*loop.TOOLS, lookup])
+    model = scripted(tool_call("lookup", key="a"), answer="One value.")
+    response = ask(make_client(model), a_submission(db))
+    assert "lookup" in model.binds[0]["tools"]
+    assert response.json()["tool_calls"] == [{"name": "lookup", "args": {"key": "a"}}]
+    assert tool_messages(model, 1)[0].content == "value for a"
+    assert activity(db, "tool_refused") == []
+
+
+def test_a_bound_method_in_the_tools_is_bound_and_run(make_client, db, monkeypatch):
+    class Table:
+        def lookup(self, key: str) -> str:
+            """Returns the value kept under a key."""
+            return f"value for {key}"
+
+    monkeypatch.setattr(loop, "TOOLS", [*loop.TOOLS, Table().lookup])
+    model = scripted(tool_call("lookup", key="a"), answer="One value.")
+    response = ask(make_client(model), a_submission(db))
+    assert response.json()["tool_calls"] == [{"name": "lookup", "args": {"key": "a"}}]
+    assert activity(db, "tool_refused") == []
+
+
+def test_a_note_cut_off_by_its_limit_is_saved_with_its_activity_row_or_not_at_all(make_client, db, monkeypatch):
+    insert, workers = app.submissions.insert_note, []
+
+    def slow_insert(*args):
+        workers.append(threading.current_thread())
+        note = insert(*args)
+        time.sleep(0.3)
+        return note
+
+    monkeypatch.setattr(app.submissions, "insert_note", slow_insert)
+    monkeypatch.setattr(loop, "TOOL_CALL_SECONDS", 0.05)
+    sub_id = a_submission(db)
+    model = scripted(tool_call("save_note", submission_id=sub_id, body="Menu came in."),
+                     tool_call("save_note", submission_id=sub_id, body="Menu came in again."), answer="Not saved.")
+    response = ask(make_client(model), sub_id)
+    for worker in workers:
+        worker.join(5)
+    assert response.status_code == 200
+    failure, = activity(db, "tool_failed")
+    assert failure["detail"].startswith("save_note:") and "TimeoutError" in failure["detail"]
+    refused, = activity(db, "tool_refused")
+    assert "already saved" in refused["detail"]
+    notes = db.execute("SELECT count(*) FROM notes WHERE body IN ('Menu came in.', 'Menu came in again.')"
+                       ).fetchone()[0]
+    assert notes == len(activity(db, "save_note")) <= 1
+    assert response.json()["tool_calls"] == []
 
 
 @tool
@@ -308,11 +499,13 @@ def test_question_past_its_deadline_is_a_502_problem(make_client, db, monkeypatc
 
 
 def test_system_prompt_names_the_submission_asker_and_date(make_client, db):
-    sub_id = a_submission(db)
+    sub_id, *business = db.execute("SELECT id, business, dba, state FROM submissions WHERE dba IS NOT NULL "
+                                   "ORDER BY id LIMIT 1").fetchone()
     model = FakeChatModel(replies=[AIMessage(content="ok")])
     ask(make_client(model), sub_id)
     prompt = model.calls[0][0].content
     assert f"number {sub_id}" in prompt and "Priya Ramaswamy" in prompt and "2026-10-01" in prompt
+    assert all(value in prompt for value in business)
 
 
 def test_unknown_submission_is_404_before_the_model(make_client):
