@@ -34,12 +34,12 @@ def _quoted(values: tuple[str, ...]) -> str:
 
 
 def _day(column: str, nullable: bool = False) -> str:
-    check = f"date({column}) IS {column} AND {column} BETWEEN '{EARLIEST_DATE}' AND '{LAST_DATE}'"
+    check = f"date({column}, '+0 days') IS {column} AND {column} BETWEEN '{EARLIEST_DATE}' AND '{LAST_DATE}'"
     return f"CHECK ({column} IS NULL OR ({check}))" if nullable else f"CHECK ({check})"
 
 
 def _moment(column: str) -> str:
-    return (f"CHECK (datetime({column}) IS replace({column}, 'T', ' ') "
+    return (f"CHECK (datetime({column}, '+0 seconds') IS replace({column}, 'T', ' ') "
             f"AND {column} BETWEEN '{EARLIEST_DATE}' AND '{LAST_DATE}T23:59:59')")
 
 

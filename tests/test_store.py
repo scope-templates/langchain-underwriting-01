@@ -160,7 +160,8 @@ def test_fact_row_needs_checked_on_and_checked_by(db):
                        f"VALUES (?, 'owner', 'x', {checked_on}, {checked_by})", (sub_id,))
 
 
-@pytest.mark.parametrize("value", ["''", "'2099-01-01'", "'2026-02-30'", "'09/01/2026'", "'1970-01-01'"])
+@pytest.mark.parametrize("value", ["''", "'2099-01-01'", "'2026-02-30'", "'2026-04-31'", "'09/01/2026'",
+                                   "'1970-01-01'"])
 def test_dates_must_be_iso_and_in_range(db, value):
     sub_id = a_submission(db)
     with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
@@ -171,11 +172,22 @@ def test_dates_must_be_iso_and_in_range(db, value):
                    f"findings) VALUES (?, 'broker_call', 'X', {value}, 3, 'x')", (sub_id,))
 
 
-@pytest.mark.parametrize("value", ["''", "'2099-01-01T10:00:00'", "'yesterday'"])
+@pytest.mark.parametrize("value", ["''", "'2099-01-01T10:00:00'", "'2026-02-30T10:00:00'", "'yesterday'"])
 def test_timestamps_must_be_iso_and_in_range(db, value):
     with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
         db.execute(f"INSERT INTO notes (submission_id, author, written_at, body) VALUES (?, 3, {value}, 'x')",
                    (a_submission(db),))
+
+
+@pytest.mark.parametrize("day", ["2026-02-28", "2026-04-30", "2028-02-29"])
+def test_real_days_and_timestamps_are_accepted(db, day):
+    sub_id = a_submission(db)
+    db.execute("INSERT INTO facts (submission_id, field, value, checked_on, checked_by) VALUES (?, 'owner', 'x', ?, 3)",
+               (sub_id, day))
+    db.execute("INSERT INTO inspections_and_calls (submission_id, kind, with_whom, held_on, recorded_by, findings) "
+               "VALUES (?, 'broker_call', 'X', ?, 3, 'x')", (sub_id, day))
+    db.execute("INSERT INTO notes (submission_id, author, written_at, body) VALUES (?, 3, ?, 'x')",
+               (sub_id, f"{day}T10:00:00"))
 
 
 def test_policy_leaves_in_force_once(db):
